@@ -42,7 +42,7 @@ type FileClient struct {
 	labels      []string
 	labelValues []string
 	orgID       string
-	engine      *logql.Engine
+	engine      logql.Engine
 }
 
 // NewFileClient returns the new instance of FileClient for the given `io.ReadCloser`
@@ -239,6 +239,10 @@ func (l *limiter) BlockedQueries(_ context.Context, _ string) []*validation.Bloc
 
 func (l *limiter) RequiredLabels(_ context.Context, _ string) []string {
 	return nil
+}
+
+func (l *limiter) EnableMultiVariantQueries(_ string) bool {
+	return false // Multi-variant queries disabled by default for file client
 }
 
 type querier struct {

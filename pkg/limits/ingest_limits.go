@@ -3,9 +3,7 @@ package limits
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
-	"net/http"
 	"sync"
 	"time"
 
@@ -22,7 +20,6 @@ import (
 	"github.com/grafana/loki/v3/pkg/logproto"
 	"github.com/grafana/loki/v3/pkg/util"
 	"github.com/grafana/loki/v3/pkg/util/constants"
-	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 const (
@@ -55,78 +52,15 @@ var (
 		[]string{"tenant"},
 		nil,
 	)
-
-	tenantIngestedBytesTotal = prometheus.NewDesc(
-		constants.Loki+"_ingest_limits_ingested_bytes_total",
-		"The total number of bytes ingested per tenant within the active window. This is not a global total, as tenants can be sharded over multiple pods.",
-		[]string{"tenant"},
-		nil,
-	)
 )
-
-// Config represents the configuration for the ingest limits service.
-type Config struct {
-	// Enabled enables the ingest limits service.
-	Enabled bool `yaml:"enabled"`
-
-	// WindowSize defines the time window for which stream metadata is considered active.
-	// Stream metadata older than WindowSize will be evicted from the metadata map.
-	WindowSize time.Duration `yaml:"window_size"`
-
-	// RateWindow defines the time window for rate calculation.
-	// This should match the window used in Prometheus rate() queries for consistency,
-	// when using the `loki_ingest_limits_ingested_bytes_total` metric.
-	// Defaults to 5 minutes if not specified.
-	RateWindow time.Duration `yaml:"rate_window"`
-
-	// BucketDuration defines the granularity of time buckets used for sliding window rate calculation.
-	// Smaller buckets provide more precise rate tracking but require more memory.
-	// Defaults to 1 minute if not specified.
-	BucketDuration time.Duration `yaml:"bucket_duration"`
-
-	// LifecyclerConfig is the config to build a ring lifecycler.
-	LifecyclerConfig ring.LifecyclerConfig `yaml:"lifecycler,omitempty"`
-
-	KafkaConfig kafka.Config `yaml:"-"`
-
-	// The number of partitions for the Kafka topic used to read and write stream metadata.
-	// It is fixed, not a maximum.
-	NumPartitions int `yaml:"num_partitions"`
-}
-
-func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
-	cfg.LifecyclerConfig.RegisterFlagsWithPrefix("ingest-limits.", f, util_log.Logger)
-	f.BoolVar(&cfg.Enabled, "ingest-limits.enabled", false, "Enable the ingest limits service.")
-	f.DurationVar(&cfg.WindowSize, "ingest-limits.window-size", 1*time.Hour, "The time window for which stream metadata is considered active.")
-	f.DurationVar(&cfg.RateWindow, "ingest-limits.rate-window", 5*time.Minute, "The time window for rate calculation. This should match the window used in Prometheus rate() queries for consistency.")
-	f.DurationVar(&cfg.BucketDuration, "ingest-limits.bucket-duration", 1*time.Minute, "The granularity of time buckets used for sliding window rate calculation. Smaller buckets provide more precise rate tracking but require more memory.")
-	f.IntVar(&cfg.NumPartitions, "ingest-limits.num-partitions", 64, "The number of partitions for the Kafka topic used to read and write stream metadata. It is fixed, not a maximum.")
-}
-
-func (cfg *Config) Validate() error {
-	if cfg.WindowSize <= 0 {
-		return errors.New("window-size must be greater than 0")
-	}
-	if cfg.RateWindow <= 0 {
-		return errors.New("rate-window must be greater than 0")
-	}
-	if cfg.BucketDuration <= 0 {
-		return errors.New("bucket-duration must be greater than 0")
-	}
-	if cfg.RateWindow < cfg.BucketDuration {
-		return errors.New("rate-window must be greater than or equal to bucket-duration")
-	}
-	if cfg.NumPartitions <= 0 {
-		return errors.New("num-partitions must be greater than 0")
-	}
-	return nil
-}
 
 type metrics struct {
 	tenantStreamEvictionsTotal *prometheus.CounterVec
 
-	kafkaReadLatency    prometheus.Histogram
+	kafkaConsumptionLag prometheus.Histogram
 	kafkaReadBytesTotal prometheus.Counter
+
+	tenantIngestedBytesTotal *prometheus.CounterVec
 }
 
 func newMetrics(reg prometheus.Registerer) *metrics {
@@ -136,20 +70,24 @@ func newMetrics(reg prometheus.Registerer) *metrics {
 			Name:      "ingest_limits_stream_evictions_total",
 			Help:      "The total number of streams evicted due to age per tenant. This is not a global total, as tenants can be sharded over multiple pods.",
 		}, []string{"tenant"}),
-		kafkaReadLatency: promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
-			Namespace:                       constants.Loki,
-			Name:                            "ingest_limits_kafka_read_latency_seconds",
-			Help:                            "Latency to read stream metadata from Kafka.",
+		kafkaConsumptionLag: promauto.With(reg).NewHistogram(prometheus.HistogramOpts{
+			Name:                            "loki_ingest_limits_kafka_consumption_lag_seconds",
+			Help:                            "The estimated consumption lag in seconds, measured as the difference between the current time and the timestamp of the record.",
 			NativeHistogramBucketFactor:     1.1,
 			NativeHistogramMinResetDuration: 1 * time.Hour,
 			NativeHistogramMaxBucketNumber:  100,
-			Buckets:                         prometheus.DefBuckets,
+			Buckets:                         prometheus.ExponentialBuckets(0.125, 2, 18),
 		}),
 		kafkaReadBytesTotal: promauto.With(reg).NewCounter(prometheus.CounterOpts{
 			Namespace: constants.Loki,
 			Name:      "ingest_limits_kafka_read_bytes_total",
 			Help:      "Total number of bytes read from Kafka.",
 		}),
+		tenantIngestedBytesTotal: promauto.With(reg).NewCounterVec(prometheus.CounterOpts{
+			Namespace: constants.Loki,
+			Name:      "ingest_limits_tenant_ingested_bytes_total",
+			Help:      "Total number of bytes ingested per tenant within the active window. This is not a global total, as tenants can be sharded over multiple pods.",
+		}, []string{"tenant"}),
 	}
 }
 
@@ -224,7 +162,7 @@ func NewIngestLimits(cfg Config, logger log.Logger, reg prometheus.Registerer) (
 	s.lifecyclerWatcher = services.NewFailureWatcher()
 	s.lifecyclerWatcher.WatchService(s.lifecycler)
 
-	metrics := client.NewReaderClientMetrics("ingest-limits", reg)
+	metrics := client.NewReaderClientMetrics("ingest-limits", reg, cfg.KafkaConfig.EnableKafkaHistograms)
 
 	// Create a copy of the config to modify the topic
 	kCfg := cfg.KafkaConfig
@@ -235,7 +173,15 @@ func NewIngestLimits(cfg Config, logger log.Logger, reg prometheus.Registerer) (
 	s.client, err = client.NewReaderClient(kCfg, metrics, logger,
 		kgo.ConsumerGroup(consumerGroup),
 		kgo.ConsumeTopics(kCfg.Topic),
-		kgo.Balancers(kgo.StickyBalancer()),
+		// TODO(periklis): Remove the sticky balancer once we rolled out
+		// the cooperative sticky balancer. According to KIP-429, once a
+		// group is using cooperative sticky balancing, it is unsafe to have
+		// a member join the group that does not support cooperative balancing.
+		// See group_balancer.go:CooperativeStickyBalancer() for more details.
+		kgo.Balancers(
+			kgo.StickyBalancer(),
+			kgo.CooperativeStickyBalancer(),
+		),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AfterMilli(time.Now().Add(-s.cfg.WindowSize).UnixMilli())),
 		kgo.OnPartitionsAssigned(s.onPartitionsAssigned),
 		kgo.OnPartitionsRevoked(s.onPartitionsRevoked),
@@ -253,7 +199,6 @@ func (s *IngestLimits) Describe(descs chan<- *prometheus.Desc) {
 	descs <- tenantPartitionDesc
 	descs <- tenantRecordedStreamsDesc
 	descs <- tenantActiveStreamsDesc
-	descs <- tenantIngestedBytesTotal
 }
 
 func (s *IngestLimits) Collect(m chan<- prometheus.Metric) {
@@ -264,9 +209,8 @@ func (s *IngestLimits) Collect(m chan<- prometheus.Metric) {
 
 	for tenant, partitions := range s.metadata {
 		var (
-			recorded   int
-			active     int
-			totalBytes uint64
+			recorded int
+			active   int
 		)
 
 		for partitionID, partition := range partitions {
@@ -279,7 +223,6 @@ func (s *IngestLimits) Collect(m chan<- prometheus.Metric) {
 			for _, stream := range partition {
 				if stream.lastSeenAt >= cutoff {
 					active++
-					totalBytes += stream.totalSize
 				}
 			}
 		}
@@ -287,7 +230,6 @@ func (s *IngestLimits) Collect(m chan<- prometheus.Metric) {
 		m <- prometheus.MustNewConstMetric(tenantPartitionDesc, prometheus.GaugeValue, float64(len(partitions)), tenant)
 		m <- prometheus.MustNewConstMetric(tenantRecordedStreamsDesc, prometheus.GaugeValue, float64(recorded), tenant)
 		m <- prometheus.MustNewConstMetric(tenantActiveStreamsDesc, prometheus.GaugeValue, float64(active), tenant)
-		m <- prometheus.MustNewConstMetric(tenantIngestedBytesTotal, prometheus.CounterValue, float64(totalBytes), tenant)
 	}
 }
 
@@ -381,8 +323,6 @@ func (s *IngestLimits) running(ctx context.Context) error {
 		case err := <-s.lifecyclerWatcher.Chan():
 			return fmt.Errorf("lifecycler failed: %w", err)
 		default:
-			startTime := time.Now()
-
 			fetches := s.client.PollRecords(ctx, 100)
 			if fetches.IsClientClosed() {
 				return nil
@@ -395,9 +335,6 @@ func (s *IngestLimits) running(ctx context.Context) error {
 				continue
 			}
 
-			// Record the latency of successful fetches
-			s.metrics.kafkaReadLatency.Observe(time.Since(startTime).Seconds())
-
 			// Process the fetched records
 			var sizeBytes int
 
@@ -405,6 +342,9 @@ func (s *IngestLimits) running(ctx context.Context) error {
 			for !iter.Done() {
 				record := iter.Next()
 				sizeBytes += len(record.Value)
+
+				// Update the estimated consumption lag.
+				s.metrics.kafkaConsumptionLag.Observe(time.Since(record.Timestamp).Seconds())
 
 				metadata, err := kafka.DecodeStreamMetadata(record)
 				if err != nil {
@@ -503,6 +443,8 @@ func (s *IngestLimits) updateMetadata(rec *logproto.StreamMetadata, tenant strin
 	recordTime := lastSeenAt.UnixNano()
 	recTotalSize := rec.EntriesSize + rec.StructuredMetadataSize
 
+	s.metrics.tenantIngestedBytesTotal.WithLabelValues(tenant).Add(float64(recTotalSize))
+
 	// Get the bucket for this timestamp using the configured interval duration
 	bucketStart := lastSeenAt.Truncate(s.cfg.BucketDuration).UnixNano()
 
@@ -584,81 +526,6 @@ func (s *IngestLimits) stopping(failureCase error) error {
 	return allErrs.Err()
 }
 
-// ServeHTTP implements the http.Handler interface.
-// It returns the current stream counts and status per tenant as a JSON response.
-func (s *IngestLimits) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
-
-	// Get the cutoff time for active streams
-	cutoff := time.Now().Add(-s.cfg.WindowSize).UnixNano()
-
-	// Get the rate window cutoff for rate calculations
-	rateWindowCutoff := time.Now().Add(-s.cfg.BucketDuration).UnixNano()
-
-	// Calculate stream counts and status per tenant
-	type tenantLimits struct {
-		Tenant        string  `json:"tenant"`
-		ActiveStreams uint64  `json:"activeStreams"`
-		Rate          float64 `json:"rate"`
-	}
-
-	// Get tenant and partitions from query parameters
-	params := r.URL.Query()
-	tenant := params.Get("tenant")
-	var (
-		activeStreams uint64
-		totalSize     uint64
-		response      tenantLimits
-	)
-
-	for _, partitions := range s.metadata[tenant] {
-		for _, stream := range partitions {
-			if stream.lastSeenAt >= cutoff {
-				activeStreams++
-
-				// Calculate size only within the rate window
-				for _, bucket := range stream.rateBuckets {
-					if bucket.timestamp >= rateWindowCutoff {
-						totalSize += bucket.size
-					}
-				}
-			}
-		}
-	}
-
-	// Calculate rate using only data from within the rate window
-	calculatedRate := float64(totalSize) / s.cfg.WindowSize.Seconds()
-
-	if activeStreams > 0 {
-		response = tenantLimits{
-			Tenant:        tenant,
-			ActiveStreams: activeStreams,
-			Rate:          calculatedRate,
-		}
-	} else {
-		// If no active streams found, return zeros
-		response = tenantLimits{
-			Tenant:        tenant,
-			ActiveStreams: 0,
-			Rate:          0,
-		}
-	}
-
-	// Log the calculated values for debugging
-	level.Debug(s.logger).Log(
-		"msg", "HTTP endpoint calculated stream usage",
-		"tenant", tenant,
-		"active_streams", activeStreams,
-		"total_size", util.HumanizeBytes(totalSize),
-		"rate_window_seconds", s.cfg.RateWindow.Seconds(),
-		"calculated_rate", util.HumanizeBytes(uint64(calculatedRate)),
-	)
-
-	// Use util.WriteJSONResponse to write the JSON response
-	util.WriteJSONResponse(w, response)
-}
-
 // GetAssignedPartitions implements the logproto.IngestLimitsServer interface.
 // It returns the partitions that the tenant is assigned to and the instance still owns.
 func (s *IngestLimits) GetAssignedPartitions(_ context.Context, _ *logproto.GetAssignedPartitionsRequest) (*logproto.GetAssignedPartitionsResponse, error) {
@@ -701,25 +568,11 @@ func (s *IngestLimits) GetStreamUsage(_ context.Context, req *logproto.GetStream
 		totalSize     uint64
 	)
 
-	for _, requestedID := range req.Partitions {
-		// Consider the recorded stream if it's partition
-		// is one of the partitions we are still assigned to.
-		assigned := false
-		for assignedID := range partitions {
-			if requestedID == assignedID {
-				assigned = true
-				break
-			}
-		}
-
-		if !assigned {
-			continue
-		}
-
-		// If the stream is written into a partition we are
-		// assigned to and has been seen within the window,
-		// it is an active stream.
-		for _, stream := range partitions[requestedID] {
+	// If the stream is written into a partition we are
+	// assigned to and has been seen within the window,
+	// it is an active stream.
+	for _, streams := range partitions {
+		for _, stream := range streams {
 			if stream.lastSeenAt < cutoff {
 				continue
 			}
@@ -759,20 +612,10 @@ func (s *IngestLimits) GetStreamUsage(_ context.Context, req *logproto.GetStream
 	// Calculate rate using only data from within the rate window
 	rate := float64(totalSize) / s.cfg.RateWindow.Seconds()
 
-	// Debug logging to help diagnose rate calculation issues
-	level.Debug(s.logger).Log(
-		"msg", "calculated stream usage",
-		"tenant", req.Tenant,
-		"active_streams", activeStreams,
-		"total_size", util.HumanizeBytes(totalSize),
-		"rate_window_seconds", s.cfg.RateWindow.Seconds(),
-		"calculated_rate", util.HumanizeBytes(uint64(rate)),
-	)
-
 	return &logproto.GetStreamUsageResponse{
 		Tenant:         req.Tenant,
 		ActiveStreams:  activeStreams,
 		UnknownStreams: unknownStreams,
-		Rate:           int64(rate),
+		Rate:           uint64(rate),
 	}, nil
 }

@@ -67,6 +67,7 @@ func IterSection(ctx context.Context, dec encoding.StreamsDecoder, section *file
 			Dataset: dset,
 			Columns: columns,
 		})
+		defer r.Close()
 
 		var rows [1]dataset.Row
 		for {
@@ -110,13 +111,13 @@ func Decode(columns []*streamsmd.ColumnDesc, row dataset.Row) (Stream, error) {
 			if ty := columnValue.Type(); ty != datasetmd.VALUE_TYPE_INT64 {
 				return stream, fmt.Errorf("invalid type %s for %s", ty, column.Type)
 			}
-			stream.MinTimestamp = time.Unix(0, columnValue.Int64()).UTC()
+			stream.MinTimestamp = time.Unix(0, columnValue.Int64())
 
 		case streamsmd.COLUMN_TYPE_MAX_TIMESTAMP:
 			if ty := columnValue.Type(); ty != datasetmd.VALUE_TYPE_INT64 {
 				return stream, fmt.Errorf("invalid type %s for %s", ty, column.Type)
 			}
-			stream.MaxTimestamp = time.Unix(0, columnValue.Int64()).UTC()
+			stream.MaxTimestamp = time.Unix(0, columnValue.Int64())
 
 		case streamsmd.COLUMN_TYPE_ROWS:
 			if ty := columnValue.Type(); ty != datasetmd.VALUE_TYPE_INT64 {
